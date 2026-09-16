@@ -1,0 +1,52 @@
+# Сценарий: сервисы, заблокированные в своей стране, с запасным сервером.
+#
+# Дома (прямой адрес Mac — в России) Telegram, YouTube и Discord идут
+# в основной туннель, а когда тот отказал — в запасной. За границей правило
+# не действует: те же сервисы идут напрямую, и ни один туннель не держится —
+# ни одному правилу он не нужен.
+#
+# Списки скачиваются из itdoginfo/allow-domains раз в сутки — через туннель
+# первого действующего правила, чей туннель работает, а если такого нет —
+# напрямую; неудачная загрузка оставляет прежнюю копию. `sudo mac-gate update`
+# скачивает их сразу.
+
+[[tunnel]]
+name = "primary"
+conf = "tunnels/primary.conf"
+
+# Каждый туннель правила после первого — запасной: он поднят и проверяется
+# заранее, и правило переходит на него, как только основной не ответил
+# на ping, на который раньше отвечал. Уже открытые соединения остаются
+# в старом туннеле, новые идут в новый. На основной правило возвращается,
+# когда тот проработал 2 минуты.
+[[tunnel]]
+name = "backup"
+conf = "tunnels/backup.conf"
+
+# Источники-URL: список доменов и список подсетей одного сервиса складываются
+# в один список.
+[[list]]
+name = "telegram"
+sources = [
+  "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/telegram.lst",
+  "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/telegram.lst",
+]
+
+[[list]]
+name = "youtube"
+sources = ["https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/youtube.lst"]
+
+[[list]]
+name = "discord"
+sources = [
+  "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/discord.lst",
+  "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/discord.lst",
+]
+
+# "RU": действует, пока страна прямого адреса — Россия, по большинству
+# ответов трёх гео-сервисов. Туннели перечислены по приоритету.
+[[rule]]
+name = "blocked-at-home"
+when = "RU"
+lists = ["telegram", "youtube", "discord"]
+tunnels = ["primary", "backup"]

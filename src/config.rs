@@ -449,4 +449,44 @@ tunnels = ["other"]
         assert!(parse(&outside).is_err());
         assert!(parse(&(with(RULE) + "[[tunnel]]\nname = \"u\"\n")).is_err());
     }
+
+    /// Every example in `examples/` passes what `install` checks before it
+    /// changes anything, and every file there is used by some example.
+    #[test]
+    fn examples_are_valid() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut used = HashSet::new();
+        let mut examples = 0;
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "toml") {
+                continue;
+            }
+            let settings = load(&path).unwrap();
+            crate::daemon::load_confs(&settings, &dir)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            used.extend(settings.tunnels.iter().map(|t| t.conf.clone()));
+            for file in settings.files() {
+                let text = fs::read_to_string(dir.join(file)).unwrap();
+                let mut lists = crate::lists::Lists::default();
+                lists.add("example", &text);
+                assert!(
+                    lists.rejected.is_empty(),
+                    "{}: {:?}",
+                    file.display(),
+                    lists.rejected
+                );
+                assert!(crate::sources::check(&text).is_ok());
+                used.insert(file.to_owned());
+            }
+            examples += 1;
+        }
+        assert!(examples > 0);
+        for sub in ["lists", "tunnels"] {
+            for entry in fs::read_dir(dir.join(sub)).unwrap() {
+                let file = Path::new(sub).join(entry.unwrap().file_name());
+                assert!(used.contains(&file), "{}: in no example", file.display());
+            }
+        }
+    }
 }
