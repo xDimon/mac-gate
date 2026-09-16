@@ -1,0 +1,28 @@
+[package]
+name = "mac-gate"
+version = "0.1.0"
+edition = "2024"
+description = "Routes listed domains and subnets into AmneziaWG tunnels on macOS, with a resolver, a tunnel watchdog and a pf kill switch"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = false
+
+[dependencies]
+hickory-proto = "0.26.3"
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio = { version = "1.53.1", features = ["rt", "net", "macros", "time", "signal", "io-util", "sync", "process"] }
+toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "serde"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
