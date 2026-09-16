@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 # Code, comments and manifests are English; prose in README.md and docs/ is not
 # checked here.
 if git grep -I -n -P '[\x{0400}-\x{04FF}]' -- \
-    src Cargo.toml clippy.toml rust-toolchain.toml check.sh awg3-server.sh .gitignore; then
+    src Cargo.toml clippy.toml rust-toolchain.toml check.sh awg3-server.sh .gitignore .github; then
     echo "non-English text in code or manifests" >&2
     exit 1
 fi
