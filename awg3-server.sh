@@ -1,11 +1,10 @@
 #!/bin/sh
 #
-# awg3-server: an AmneziaWG 3.1 server in its own container, beside any
-# Amnezia container already on the host, which this script never touches.
+# awg3-server: an AmneziaWG 3.1 server in its own container.
 #
 # Runs on the server as root, fed over ssh:
 #   ssh HOST 'sh -s -- install [port]' < awg3-server.sh
-#   ssh HOST 'sh -s -- add-peer <name> <public-key>' < awg3-server.sh > peer.conf
+#   ssh HOST 'sh -s -- add-peer [-d DNS] [-a ADDR] <name> <public-key>' < awg3-server.sh > peer.conf
 #   ssh HOST 'sh -s -- status' < awg3-server.sh
 #   ssh HOST 'sh -s -- uninstall' < awg3-server.sh
 #
@@ -15,6 +14,17 @@
 # key never reaches the server; obfuscation parameters are drawn per server
 # instead of the client's shared defaults.
 #
+# Several servers on one host: AWG_NAME, AWG_DIR, AWG_SUBNET and AWG_IMAGE
+# override the defaults below, so the same script installs and serves each
+# of them. Give every server its own name, directory and subnet.
+#
+# The AmneziaVPN client app recognises a server by the container name and
+# the files it keeps beside the config, so those are written here too:
+# the client table and the server key files. An app-made container can be
+# replaced by this script - keep its name and image, and the app goes on
+# seeing the server, now with its config on the host instead of inside a
+# container layer that every update discards.
+#
 # add-peer prints the peer's config without PrivateKey. It still carries
 # the preshared and header protection keys: redirect it to a file with
 # restricted permissions, never to a terminal or a log.
@@ -22,14 +32,20 @@
 
 set -eu
 
-IMAGE="amneziavpn/amneziawg-go:3.1.20260828"
-NAME="awg3"
-DIR="/opt/awg3"
+IMAGE="${AWG_IMAGE:-amneziavpn/amneziawg-go:3.1.20260828}"
+NAME="${AWG_NAME:-awg3}"
+DIR="${AWG_DIR:-/opt/awg3}"
 CONF="$DIR/awg0.conf"
 PORT_FILE="$DIR/port"
 IN_CONTAINER="/opt/amnezia/awg"
 
-SUBNET="10.8.3"
+# What the client app expects to find next to the config.
+TABLE="$DIR/clientsTable"
+KEY_PRIV="$DIR/wireguard_server_private_key.key"
+KEY_PUB="$DIR/wireguard_server_public_key.key"
+KEY_PSK="$DIR/wireguard_psk.key"
+
+SUBNET="${AWG_SUBNET:-10.8.3}"
 SERVER_ADDR="$SUBNET.1"
 PORT_MIN=30000
 PORT_MAX=60999
@@ -72,7 +88,9 @@ pick_word() {
 }
 
 container_exists() {
-    docker inspect "$NAME" >/dev/null 2>&1
+    # "docker inspect" answers for an image of the same name too, and an
+    # app-made server has exactly that: image and container share a name.
+    docker container inspect "$NAME" >/dev/null 2>&1
 }
 
 port_in_use() {
@@ -92,6 +110,42 @@ pick_port() {
 
 genkey() {
     docker run --rm --entrypoint awg "$IMAGE" genkey
+}
+
+pubkey() {
+    printf '%s' "$1" | docker run -i --rm --entrypoint awg "$IMAGE" pubkey
+}
+
+genpsk() {
+    docker run --rm --entrypoint awg "$IMAGE" genpsk
+}
+
+#
+# The client table the app reads: one entry per peer, appended in the
+# app's own layout. Written by this script from the first install on, so
+# the closing bracket is always the last line.
+#
+table_add() {
+    local pub="$1" name="$2" addr="$3" tmp="$TABLE.new"
+
+    if grep -q '"clientId"' "$TABLE" 2>/dev/null; then
+        sed '$d' "$TABLE" | sed '$ s/^\( *\)}$/\1},/' >"$tmp"
+    else
+        echo "[" >"$tmp"
+    fi
+
+    cat >>"$tmp" <<EOF
+    {
+        "clientId": "$pub",
+        "userData": {
+            "allowed_ips": "$addr",
+            "clientName": "$name",
+            "creationDate": "$(date '+%a %b %e %H:%M:%S %Y')"
+        }
+    }
+]
+EOF
+    mv "$tmp" "$TABLE"
 }
 
 #
@@ -169,6 +223,13 @@ write_server_conf() {
     hpk=$(genkey)
     [ ${#priv} -eq 44 ] && [ ${#hpk} -eq 44 ] || die "key generation failed"
 
+    # The app looks for its key files beside the config; without them it
+    # treats the server as not installed.
+    printf '%s\n' "$priv" >"$KEY_PRIV"
+    pubkey "$priv" >"$KEY_PUB"
+    genpsk >"$KEY_PSK"
+    printf '[\n]\n' >"$TABLE"
+
     s=$(rnd 12 64)
     set -- $(gen_headers)
     h1=$1 h2=$2 h3=$3 h4=$4
@@ -223,7 +284,10 @@ cmd_install() {
         else
             port=$(pick_port) || die "no free udp port found"
         fi
-        docker pull -q "$IMAGE" >/dev/null
+        # An image built on the host - the app builds its own - has nothing
+        # to be pulled from.
+        docker image inspect "$IMAGE" >/dev/null 2>&1 ||
+            docker pull -q "$IMAGE" >/dev/null
         write_server_conf "$port"
         echo "$port" >"$PORT_FILE"
     fi
@@ -269,38 +333,73 @@ conf_value() {
 }
 
 cmd_add_peer() {
-    local name="${1:-}" pub="${2:-}" addr psk key
+    local name pub addr psk key i1 dns="" want=""
 
-    [ -n "$name" ] && [ -n "$pub" ] || die "usage: add-peer <name> <public-key>"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -d) dns="${2:-}"; [ -n "$dns" ] || die "-d needs a resolver"; shift 2 ;;
+            -a) want="${2:-}"; [ -n "$want" ] || die "-a needs an address"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+
+    name="${1:-}" pub="${2:-}"
+    [ -n "$name" ] && [ -n "$pub" ] || die "usage: add-peer [-d DNS] [-a ADDR] <name> <public-key>"
     printf '%s' "$pub" | grep -qE '^[A-Za-z0-9+/]{43}=$' || die "not a public key: $pub"
     container_exists || die "container $NAME is not installed"
     grep -qF "PublicKey = $pub" "$CONF" && die "peer with this key already exists"
 
-    addr=$(next_peer_addr) || die "subnet $SUBNET.0/24 is full"
+    if [ -n "$want" ]; then
+        # An address asked for by hand: a numbering scheme of one's own
+        # outlives the order peers happened to be added in.
+        case "$want" in
+            "$SUBNET".*) ;;
+            *) die "address $want is outside $SUBNET.0/24" ;;
+        esac
+        grep -qF "AllowedIPs = $want/32" "$CONF" && die "address $want is taken"
+        addr="$want"
+    else
+        addr=$(next_peer_addr) || die "subnet $SUBNET.0/24 is full"
+    fi
     psk=$(docker exec "$NAME" awg genpsk)
+    i1=$(gen_i1)
 
+    # I1 is the peer's alone and the server never sends it, but a peer that
+    # has to be issued again should get the packet it already had: kept as
+    # a comment, which awg-quick strips along with the rest.
     umask 077
     cat >>"$CONF" <<EOF
 
 [Peer]
 # $name
+# I1 = $i1
 PublicKey = $pub
 PresharedKey = $psk
 AllowedIPs = $addr/32
 EOF
 
-    docker exec "$NAME" bash -c \
-        "awg syncconf awg0 <(awg-quick strip $IN_CONTAINER/awg0.conf) && ip route replace $addr/32 dev awg0"
+    # No process substitution: the app's own image is not guaranteed to
+    # have a shell that provides it.
+    docker exec "$NAME" sh -c \
+        "awg-quick strip $IN_CONTAINER/awg0.conf > /tmp/awg0.stripped && \
+         awg syncconf awg0 /tmp/awg0.stripped && \
+         rm -f /tmp/awg0.stripped && \
+         ip route replace $addr/32 dev awg0"
+
+    table_add "$pub" "$name" "$addr/32"
 
     # Client side: junk and I1 matter only on the sending side, timers and
     # the rest must match what the server was drawn with.
     echo "[Interface]"
     echo "Address = $addr/32"
     echo "MTU = $CLIENT_MTU"
+    if [ -n "$dns" ]; then
+        echo "DNS = $dns"
+    fi
     for key in Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4; do
         echo "$key = $(conf_value $key)"
     done
-    echo "I1 = $(gen_i1)"
+    echo "I1 = $i1"
     for key in HeaderProtectionKey ContentPaddingAddition RekeyAfterTime RekeyTimeout \
         RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts RandomTrailers DisableCookies; do
         echo "$key = $(conf_value $key)"
@@ -330,7 +429,8 @@ cmd_status() {
     else
         echo "awg0: down"
     fi
-    grep '^# ' "$CONF" | sed 's/^# /peer name: /' || true
+    # Peer names only: the I1 kept beside each of them is a comment too.
+    grep '^# ' "$CONF" | grep -v '^# I1 = ' | sed 's/^# /peer name: /' || true
 }
 
 cmd_uninstall() {
@@ -344,5 +444,5 @@ case "${1:-}" in
     add-peer) shift; cmd_add_peer "$@" ;;
     status) cmd_status ;;
     uninstall) cmd_uninstall ;;
-    *) die "usage: install [port] | add-peer <name> <public-key> | status | uninstall" ;;
+    *) die "usage: install [port] | add-peer [-d DNS] [-a ADDR] <name> <public-key> | status | uninstall" ;;
 esac
