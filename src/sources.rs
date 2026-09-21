@@ -1,7 +1,9 @@
 //! Sources of the lists: files beside the settings, read again when they
 //! change, and URLs, fetched once a day into a cache the lists are built
 //! from. A fetch that fails or brings no entries leaves the last good copy
-//! in place, and is tried again in an hour.
+//! in place, and is tried again in an hour. Every source is kept as a copy,
+//! files included: a source that stops reading falls back on its copy
+//! instead of leaving the list short.
 
 use std::collections::HashMap;
 use std::fs;
@@ -57,6 +59,19 @@ pub fn check(text: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// How many entries a file holds, or why it could not be read: for the
+/// journal, where a changed file says what it now brings.
+fn entries_of(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let mut l = Lists::default();
+            l.add("count", &text);
+            format!("entries={}", l.entry_count())
+        }
+        Err(e) => format!("unreadable: {e}"),
+    }
+}
+
 /// An HTTP error, a redirect loop or an oversize body fails; the body of
 /// an error page never passes for the list.
 pub async fn fetch(url: &str, iface: Option<&str>) -> io::Result<String> {
@@ -104,24 +119,67 @@ pub fn write_cache(path: &Path, text: &str) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// What a build of the lists found.
+#[derive(Debug, Default)]
+pub struct Built {
+    pub lists: Lists,
+    /// Sources with neither a readable file nor a copy, as "list source: why".
+    pub missing: Vec<String>,
+    /// File sources taken from their copy, the file itself unreadable.
+    pub stale: Vec<String>,
+}
+
+/// The copy of a file source is named by the path the settings write, so
+/// that a renamed file never reads the copy of the old one. The prefix
+/// keeps it apart from the copy of a URL.
+fn file_key(rel: &Path) -> String {
+    format!("file:{}", rel.display())
+}
+
+/// A file source: read beside the settings and kept as a copy, else taken
+/// from the last copy. A copy is written only when the text is a list, so
+/// that a truncated read never replaces a good one; a file that reads and
+/// holds nothing is taken as it is — emptying a list is the owner's to do.
+fn read_file(rel: &Path, base: &Path, cache: &Path) -> Result<(String, bool), String> {
+    let copy = cache_file(cache, &file_key(rel));
+    match fs::read_to_string(base.join(rel)) {
+        Ok(text) => {
+            if check(&text).is_ok() {
+                let _ = write_cache(&copy, &text);
+            }
+            Ok((text, false))
+        }
+        Err(e) => match fs::read_to_string(&copy) {
+            Ok(text) => Ok((text, true)),
+            Err(_) => Err(e.to_string()),
+        },
+    }
+}
+
 /// The lists from the files and the cached copies, in the order of the
-/// settings. A source that cannot be read is missing, and named.
-pub fn build(settings: &Settings, base: &Path, cache: &Path) -> (Lists, Vec<String>) {
-    let mut lists = Lists::default();
-    let mut missing = Vec::new();
+/// settings. A source with neither a file nor a copy is missing, and named.
+pub fn build(settings: &Settings, base: &Path, cache: &Path) -> Built {
+    let mut out = Built::default();
     for list in &settings.lists {
         for source in &list.sources {
-            let path = match source {
-                Source::File(p) => base.join(p),
-                Source::Url(u) => cache_file(cache, u),
+            let got = match source {
+                Source::File(p) => read_file(p, base, cache),
+                Source::Url(u) => fs::read_to_string(cache_file(cache, u))
+                    .map(|text| (text, false))
+                    .map_err(|e| e.to_string()),
             };
-            match fs::read_to_string(&path) {
-                Ok(text) => lists.add(&list.name, &text),
-                Err(e) => missing.push(format!("{} {source}: {e}", list.name)),
+            match got {
+                Ok((text, from_copy)) => {
+                    if from_copy {
+                        out.stale.push(format!("{} {source}", list.name));
+                    }
+                    out.lists.add(&list.name, &text);
+                }
+                Err(e) => out.missing.push(format!("{} {source}: {e}", list.name)),
             }
         }
     }
-    (lists, missing)
+    out
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -181,7 +239,7 @@ impl Updater {
         }
     }
 
-    pub fn build(&self) -> (Lists, Vec<String>) {
+    pub fn build(&self) -> Built {
         build(&self.settings, &self.base, &self.cache)
     }
 
@@ -210,7 +268,11 @@ impl Updater {
             if t != *stamp {
                 *stamp = t;
                 changed = true;
-                journal.log(format_args!("source {} changed", path.display()));
+                journal.log(format_args!(
+                    "source {} changed {}",
+                    path.display(),
+                    entries_of(path)
+                ));
             }
         }
         if self.task.is_none() {
@@ -318,11 +380,46 @@ mod tests {
         )
         .unwrap();
         write_cache(&cache_file(&cache, "https://h/a.lst"), "telegram.org\n").unwrap();
-        let (lists, missing) = build(&s, &dir, &cache);
-        assert_eq!(lists.match_domain("x.example.com"), ["custom"]);
-        assert_eq!(lists.match_domain("telegram.org"), ["telegram"]);
-        assert_eq!(missing.len(), 1);
-        assert!(missing[0].starts_with("telegram https://h/b.lst: "));
+        let built = build(&s, &dir, &cache);
+        assert_eq!(built.lists.match_domain("x.example.com"), ["custom"]);
+        assert_eq!(built.lists.match_domain("telegram.org"), ["telegram"]);
+        assert_eq!(built.missing.len(), 1);
+        assert!(built.missing[0].starts_with("telegram https://h/b.lst: "));
+        assert!(built.stale.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The file source is kept as a copy: gone from disk, it still builds,
+    /// and says so. A file that reads and holds nothing is taken as it is.
+    #[test]
+    fn a_file_source_falls_back_on_its_copy() {
+        let dir = std::env::temp_dir().join(format!("mac-gate-file-{}", std::process::id()));
+        let cache = dir.join("cache");
+        let file = dir.join("lists/custom.lst");
+        fs::create_dir_all(dir.join("lists")).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(&file, "example.com\n").unwrap();
+        let s = parse(
+            "[[list]]\nname = \"custom\"\nsources = [\"lists/custom.lst\"]\n\
+             [[tunnel]]\nname = \"t\"\nconf = \"t.conf\"\n\
+             [[rule]]\nname = \"r\"\nwhen = \"always\"\nlists = [\"custom\"]\ntunnels = [\"t\"]\n",
+        )
+        .unwrap();
+        let built = build(&s, &dir, &cache);
+        assert_eq!(built.lists.match_domain("example.com"), ["custom"]);
+        assert!(built.stale.is_empty() && built.missing.is_empty());
+
+        fs::remove_file(&file).unwrap();
+        let built = build(&s, &dir, &cache);
+        assert_eq!(built.lists.match_domain("example.com"), ["custom"]);
+        assert_eq!(built.stale, ["custom lists/custom.lst".to_owned()]);
+        assert!(built.missing.is_empty());
+
+        // Emptied on purpose: the copy is neither written nor read.
+        fs::write(&file, "\n").unwrap();
+        let built = build(&s, &dir, &cache);
+        assert!(built.lists.match_domain("example.com").is_empty());
+        assert!(built.stale.is_empty() && built.missing.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

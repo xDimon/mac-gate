@@ -33,7 +33,7 @@ use crate::net::{self, Clock, Network, RouteEvents};
 use crate::pf::{Pf, write_private};
 use crate::resolver::{Journal, LinkState, Reasons, Resolver};
 use crate::route::RouteSocket;
-use crate::sources::{self, Updater};
+use crate::sources::{self, Built, Updater};
 use crate::state;
 use crate::sysdns;
 use crate::tunnel::{self, Conf, Tools};
@@ -247,10 +247,10 @@ fn log_start(
     cfg: &Config,
     settings: &Settings,
     confs: &[Conf],
-    lists: &crate::lists::Lists,
-    missing: &[String],
+    built: &Built,
     saved: usize,
 ) {
+    let lists = &built.lists;
     let ignored: Vec<String> = settings
         .tunnels
         .iter()
@@ -259,14 +259,15 @@ fn log_start(
         .map(|(t, c)| format!("{}:{}", t.name, c.ignored.join(",")))
         .collect();
     journal.log(format_args!(
-        "start daemon rules={} tunnels={} lists={} suffixes={} subnets={} rejected={} missing={} saved_hosts={saved} listen={} tunnel_dns={} window={}s use_fakeip={} conf_ignored={ignored:?}",
+        "start daemon rules={} tunnels={} lists={} suffixes={} subnets={} rejected={} missing={} stale={} saved_hosts={saved} listen={} tunnel_dns={} window={}s use_fakeip={} conf_ignored={ignored:?}",
         settings.rules.len(),
         settings.tunnels.len(),
         settings.lists.len(),
         lists.suffix_count(),
         lists.subnets().count(),
         lists.rejected.len(),
-        missing.len(),
+        built.missing.len(),
+        built.stale.len(),
         cfg.listen,
         cfg.tunnel_dns,
         cfg.window,
@@ -275,8 +276,11 @@ fn log_start(
     for line in &lists.rejected {
         journal.log(format_args!("rejected {line}"));
     }
-    for line in missing {
+    for line in &built.missing {
         journal.log(format_args!("source-missing {line}"));
+    }
+    for line in &built.stale {
+        journal.log(format_args!("source-stale {line}"));
     }
 }
 
@@ -347,16 +351,8 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     let journal = Journal::open(cfg.journal.as_deref())?;
     let dir = dir_of(&cfg.state);
     // A source without a copy yet is fetched in the first step.
-    let (lists, missing) = updater.build();
-    log_start(
-        &journal,
-        &cfg,
-        &settings,
-        &confs,
-        &lists,
-        &missing,
-        saved.len(),
-    );
+    let built = updater.build();
+    log_start(&journal, &cfg, &settings, &confs, &built, saved.len());
     let udp = UdpSocket::bind(cfg.listen).await?;
     let tcp = TcpListener::bind(cfg.listen).await?;
     let events = RouteEvents::open()?;
@@ -366,7 +362,7 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     pf.enable().await?;
     let hosts = hosts_to_restore(&settings, saved, &pf, &journal).await;
     let resolver = Arc::new(Resolver::new(
-        lists,
+        built.lists,
         &settings.rules,
         settings.tunnels.iter().map(|t| t.name.clone()).collect(),
         cfg.tunnel_dns,
@@ -420,6 +416,8 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     let links = spawn_links(&settings, confs, &resolver, &tools, &net_rx);
     let mut moved = net_rx.clone();
     let mut watch = Watch::new(resolver, &cfg, net_rx, nudge, updater, links, country);
+    watch.missing = built.missing;
+    watch.stale = built.stale;
     if !strays.is_empty() {
         watch.strays = Some((strays, Instant::now()));
     }
@@ -512,6 +510,12 @@ struct Watch {
     /// bring one that does not ask the resolver yet.
     dns_at: Option<Instant>,
     updater: Updater,
+    /// Sources with neither a file nor a copy, and file sources running on
+    /// their copy, as the last build found them. Written to the journal
+    /// with every status line: a source that never comes back would
+    /// otherwise be named once, at the start, and never again.
+    missing: Vec<String>,
+    stale: Vec<String>,
     /// amneziawg-go of a daemon that died, and since when they wait.
     strays: Option<(Vec<u32>, Instant)>,
 }
@@ -550,6 +554,8 @@ impl Watch {
             dns_dir: cfg.system_dns.then(|| dir.clone()),
             dns_at: None,
             updater,
+            missing: Vec::new(),
+            stale: Vec::new(),
             strays: None,
             dir,
         }
@@ -712,10 +718,16 @@ impl Watch {
         if !self.updater.poll(tunnel, &self.resolver.journal).await {
             return;
         }
-        let (lists, missing) = self.updater.build();
-        for line in &missing {
+        let built = self.updater.build();
+        for line in &built.missing {
             self.log(format_args!("source-missing {line}"));
         }
+        for line in &built.stale {
+            self.log(format_args!("source-stale {line}"));
+        }
+        self.missing = built.missing;
+        self.stale = built.stale;
+        let lists = built.lists;
         if lists.entry_count() == 0 {
             self.log(format_args!(
                 "lists-refused no entries; the lists in place stay"
@@ -811,10 +823,20 @@ impl Watch {
             self.status_at = now + STATUS_EVERY;
             let (code, from) = self.country.now();
             self.log(format_args!(
-                "status {} country={code} from={from} network={}",
+                "status {} missing={} stale={} country={code} from={from} network={}",
                 self.resolver.status(),
+                self.missing.len(),
+                self.stale.len(),
                 show(self.network.as_ref()),
             ));
+            // Named again every time, not only when they appear: a source
+            // that stays away changes nothing and would go quiet.
+            for line in &self.missing {
+                self.log(format_args!("source-missing {line}"));
+            }
+            for line in &self.stale {
+                self.log(format_args!("source-stale {line}"));
+            }
         }
     }
 

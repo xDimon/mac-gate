@@ -711,8 +711,12 @@ impl Resolver {
             .collect()
     }
 
-    /// The rules, the tunnels and the hosts, for the status line.
+    /// The rules, the tunnels, the lists and the hosts, for the status
+    /// line. The sizes of the lists belong here and not only in `start
+    /// daemon`: lists that shrank to nothing are invisible in a line that
+    /// says only how the tunnels are.
     pub fn status(&self) -> String {
+        let lists = self.lists();
         let core = self.core();
         let rules: Vec<String> = core
             .rules
@@ -740,9 +744,11 @@ impl Resolver {
             })
             .collect();
         format!(
-            "rules={} tunnels={} hosts={} use_fakeip={} owner={}",
+            "rules={} tunnels={} suffixes={} subnets={} hosts={} use_fakeip={} owner={}",
             rules.join(","),
             links.join(","),
+            lists.suffix_count(),
+            lists.subnets().count(),
             core.hosts.len(),
             core.use_fakeip,
             core.owner
