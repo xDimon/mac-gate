@@ -143,7 +143,49 @@ pub fn reply(req: &Message, code: ResponseCode) -> Option<Vec<u8>> {
 /// after the first: a network change fails hundreds of queries at once.
 const BURST: Duration = Duration::from_secs(10);
 
-/// Timestamped event lines: "<unix microseconds> <event>".
+/// A journal stamp: local date and time to the microsecond, in the
+/// timezone of the Mac. The journal is read next to `date`, `tail -f` and
+/// the clock of the person reading it, so its lines carry the same time.
+fn stamp(date: (i64, i64, i64), time: (i64, i64, i64), us: u32) -> String {
+    let ((y, mon, day), (h, min, sec)) = (date, time);
+    format!("{y:04}.{mon:02}.{day:02} {h:02}:{min:02}:{sec:02}.{us:06}")
+}
+
+/// The stamp for now. Falls back to Unix microseconds when the system
+/// cannot tell the time in local terms: a line is never lost over its
+/// stamp.
+#[allow(unsafe_code)]
+fn now_stamp() -> String {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let us = d.subsec_micros();
+    let t = libc::time_t::try_from(d.as_secs()).unwrap_or_default();
+    // SAFETY: localtime_r reads `t` and writes `tm`, both owned here and
+    // alive past the call; it keeps neither pointer.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&raw const t, &raw mut tm).is_null() {
+            return d.as_micros().to_string();
+        }
+        tm
+    };
+    stamp(
+        (
+            i64::from(tm.tm_year) + 1900,
+            i64::from(tm.tm_mon) + 1,
+            i64::from(tm.tm_mday),
+        ),
+        (
+            i64::from(tm.tm_hour),
+            i64::from(tm.tm_min),
+            i64::from(tm.tm_sec),
+        ),
+        us,
+    )
+}
+
+/// Timestamped event lines: "<local time> <event>".
 pub struct Journal {
     out: Mutex<Box<dyn Write + Send>>,
     /// Kind of event to the end of its burst and the repeats counted in it.
@@ -216,11 +258,9 @@ impl Journal {
     }
 
     pub fn log(&self, event: fmt::Arguments<'_>) {
-        let us = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_micros());
+        let at = now_stamp();
         if let Ok(mut out) = self.out.lock() {
-            let _ = writeln!(out, "{us} {event}");
+            let _ = writeln!(out, "{at} {event}");
             let _ = out.flush();
         }
     }
@@ -1373,6 +1413,24 @@ mod tests {
         assert!(routable(Ipv4Addr::new(198, 20, 0, 1), &[]));
     }
 
+    #[test]
+    fn a_journal_stamp_reads_as_a_clock() {
+        assert_eq!(
+            stamp((2026, 9, 22), (17, 52, 6), 971_589),
+            "2026.09.22 17:52:06.971589"
+        );
+        // Every field padded: a stamp is always the same width, so the
+        // lines stay in a column and sort by it.
+        assert_eq!(
+            stamp((2026, 1, 2), (3, 4, 5), 60),
+            "2026.01.02 03:04:05.000060"
+        );
+        assert_eq!(
+            stamp((2026, 12, 31), (23, 59, 59), 999_999),
+            "2026.12.31 23:59:59.999999"
+        );
+    }
+
     fn link(index: u16, alive: bool, since: Option<Instant>) -> LinkState {
         LinkState {
             iface: Some(Iface {
@@ -1586,7 +1644,12 @@ tunnels = ["other"]
         j.burst("network-fail", format_args!("network-fail again"));
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        let events: Vec<&str> = text.lines().map(|l| l.split_once(' ').unwrap().1).collect();
+        // The stamp is a date and a time, so the event starts at the
+        // third field.
+        let events: Vec<&str> = text
+            .lines()
+            .map(|l| l.splitn(3, ' ').nth(2).unwrap())
+            .collect();
         assert_eq!(
             events,
             vec![
