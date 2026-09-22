@@ -11,18 +11,31 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
+
+use crate::degraded;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSettings {
+    watch: Option<RawWatch>,
     #[serde(rename = "list", default)]
     lists: Vec<RawList>,
     #[serde(rename = "tunnel", default)]
     tunnels: Vec<RawTunnel>,
     #[serde(rename = "rule", default)]
     rules: Vec<RawRule>,
+}
+
+/// What the watchdog is told; every key has a default.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWatch {
+    /// Seconds a degraded tunnel is left alone; 0 - for as long as it
+    /// takes.
+    degraded_grace: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,11 +146,16 @@ pub struct Rule {
     pub tunnels: Vec<usize>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// No Default: zero `degraded_grace` means patience without end, which is
+/// not what an empty value should stand for.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub lists: Vec<List>,
     pub tunnels: Vec<Tunnel>,
     pub rules: Vec<Rule>,
+    /// How long a tunnel that the peer still answers through, while no
+    /// probe gets past it, is left alone; zero - for as long as it takes.
+    pub degraded_grace: Duration,
 }
 
 impl Settings {
@@ -202,6 +220,11 @@ fn refs(rule: &str, kind: &str, names: &[String], known: &[&str]) -> Result<(), 
 
 pub fn parse(text: &str) -> Result<Settings, String> {
     let raw: RawSettings = toml::from_str(text).map_err(|e| e.to_string())?;
+    let degraded_grace = raw
+        .watch
+        .as_ref()
+        .and_then(|w| w.degraded_grace)
+        .map_or(degraded::GRACE, Duration::from_secs);
     if raw.lists.is_empty() {
         return Err("no [[list]]".to_owned());
     }
@@ -281,6 +304,7 @@ pub fn parse(text: &str) -> Result<Settings, String> {
         lists,
         tunnels,
         rules,
+        degraded_grace,
     })
 }
 
@@ -352,6 +376,26 @@ when = "!DE"
 lists = ["regional"]
 tunnels = ["other"]
 "#;
+
+    #[test]
+    fn the_watchdog_settings_have_defaults() {
+        assert_eq!(parse(GOOD).unwrap().degraded_grace, degraded::GRACE);
+        let with = format!("[watch]\ndegraded_grace = 600\n{GOOD}");
+        assert_eq!(
+            parse(&with).unwrap().degraded_grace,
+            Duration::from_mins(10)
+        );
+        // Zero is patience without end, not no patience at all.
+        let none = format!("[watch]\ndegraded_grace = 0\n{GOOD}");
+        assert_eq!(parse(&none).unwrap().degraded_grace, Duration::ZERO);
+        // An empty table is the defaults; a key nobody knows is a mistake.
+        assert_eq!(
+            parse(&format!("[watch]\n{GOOD}")).unwrap().degraded_grace,
+            degraded::GRACE
+        );
+        assert!(parse(&format!("[watch]\ngrace = 5\n{GOOD}")).is_err());
+        assert!(parse(&format!("[watch]\ndegraded_grace = \"x\"\n{GOOD}")).is_err());
+    }
 
     #[test]
     fn lists_tunnels_and_rules_in_order() {

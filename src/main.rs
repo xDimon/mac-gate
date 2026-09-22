@@ -4,6 +4,7 @@
 mod command;
 mod config;
 mod daemon;
+mod degraded;
 mod geo;
 mod install;
 mod link;
@@ -32,7 +33,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::config::{Rule, When};
 use crate::lists::Lists;
-use crate::resolver::{Iface, Journal, LinkState, Resolver};
+use crate::resolver::{Health, Iface, Journal, LinkState, Resolver};
 use crate::route::RouteSocket;
 use crate::upstream::Upstream;
 
@@ -352,7 +353,7 @@ async fn resolve(args: Args) -> Result<(), Box<dyn Error>> {
                 index: tunnel_if,
             }),
             generation: 1,
-            alive: true,
+            health: Health::Up,
             since: Some(std::time::Instant::now()),
             ..LinkState::default()
         },

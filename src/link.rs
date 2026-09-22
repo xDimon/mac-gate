@@ -19,9 +19,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch::Receiver;
 
-use crate::net::{self, Network};
+use crate::degraded::{self, Degradation, Verdict};
+use crate::net::{self, Clock, Network};
 use crate::probe::{self, TARGETS};
-use crate::resolver::{Iface, LinkState, Resolver};
+use crate::resolver::{Health, Iface, LinkState, Resolver};
 use crate::tunnel::{Conf, Tools, Tunnel};
 
 const TICK: Duration = Duration::from_secs(1);
@@ -83,16 +84,6 @@ enum Found {
     Tls(Duration),
 }
 
-/// What the checks say of the tunnel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Health {
-    /// Not confirmed yet, or failed.
-    Down,
-    Up,
-    /// Was up, but the ping that used to answer is silent; TLS is to tell.
-    Suspect,
-}
-
 pub struct Link {
     id: usize,
     name: String,
@@ -124,6 +115,17 @@ pub struct Link {
     /// A new network or a wake not yet checked, since when.
     works: Option<Instant>,
     health: Health,
+    /// How long a degraded tunnel is left alone, and for how long it has
+    /// been degraded.
+    degradation: Degradation,
+    /// The reconnect was made because of degradation: its tunnel goes to
+    /// the checks, not to the fast attempts.
+    after_degraded: bool,
+    /// Bytes the interface had received at the last check.
+    rx_seen: Option<u64>,
+    /// A wake or a new network: what the tunnel did before one says
+    /// nothing about what it does now.
+    disturbed_at: Instant,
     since: Option<Instant>,
     /// The ping has answered through this tunnel: its silence means
     /// something. Some servers never answer it.
@@ -178,11 +180,23 @@ impl Link {
             pending: Some(("start", now)),
             works: None,
             health: Health::Down,
+            degradation: Degradation::new(degraded::GRACE),
+            after_degraded: false,
+            rx_seen: None,
+            disturbed_at: now,
             since: None,
             pinged: false,
             endpoint,
             published: LinkState::default(),
         }
+    }
+
+    /// How long a degraded tunnel is left alone, from the settings; zero
+    /// is for as long as it takes.
+    #[must_use]
+    pub const fn grace(mut self, grace: Duration) -> Self {
+        self.degradation = Degradation::new(grace);
+        self
     }
 
     pub async fn run(mut self) {
@@ -211,8 +225,7 @@ impl Link {
                 index: t.index,
             }),
             generation: self.generation,
-            alive: self.health != Health::Down,
-            suspect: self.health == Health::Suspect,
+            health: self.health,
             works: self.works.is_some(),
             since: self.since,
             endpoint: self.endpoint,
@@ -269,8 +282,11 @@ impl Link {
             }
             self.sync().await;
         }
+        // A degraded tunnel is already known to get nothing back: the cut
+        // detector would raise it at every window for nothing.
         if self.connect_at.is_none()
             && self.next == Next::Usual
+            && self.health != Health::Degraded
             && Instant::now() >= self.cut_quiet_until
             && self.cut_seen().await
         {
@@ -291,6 +307,7 @@ impl Link {
     }
 
     fn woke(&mut self, now: Instant) {
+        self.disturbed_at = now;
         self.fresh(now);
         self.next = Next::Woke;
         self.pending = Some(("wake", now));
@@ -301,6 +318,7 @@ impl Link {
     fn follow_network(&mut self, n: Option<Network>) {
         self.network = n;
         let now = Instant::now();
+        self.disturbed_at = now;
         self.fresh(now);
         self.pending.get_or_insert(("network", now));
         if self.network.is_some() {
@@ -326,6 +344,7 @@ impl Link {
     /// Carries: from a doubt or a failure, its time to take a rule back
     /// starts now, and it is checked often meanwhile.
     fn healthy(&mut self, now: Instant) {
+        self.degradation.passed();
         if self.health != Health::Up || self.since.is_none() {
             self.since = Some(now);
             self.fresh(now);
@@ -359,18 +378,53 @@ impl Link {
         self.sync().await;
     }
 
-    /// Runs a probe unless the network changes first; None when it did.
-    async fn unless_moved<T>(&self, probe: impl Future<Output = T>) -> Option<T> {
+    /// Runs a probe unless the Mac moves to another network or wakes from
+    /// sleep first; None when it did. Such a probe found nothing about the
+    /// tunnel: it was cut short, or it sat out a sleep with its timeout
+    /// running. Both are answered by asking again, not by a verdict.
+    async fn undisturbed<T>(&self, probe: impl Future<Output = T>) -> Option<T> {
+        let mut clock = Clock::default();
         let mut net = self.net.clone();
-        let moved = async move {
-            if net.changed().await.is_err() {
-                std::future::pending::<()>().await;
+        let mut ctl = self.ctl.clone();
+        let wakes = self.wakes;
+        let disturbed = async move {
+            loop {
+                tokio::select! {
+                    moved = net.changed() => {
+                        if moved.is_err() {
+                            break;
+                        }
+                        return;
+                    }
+                    told = ctl.changed() => {
+                        if told.is_err() {
+                            break;
+                        }
+                        // A rule taking or leaving the tunnel is no reason
+                        // to drop a probe; a wake is.
+                        if ctl.borrow_and_update().wakes != wakes {
+                            return;
+                        }
+                    }
+                }
             }
+            std::future::pending::<()>().await;
         };
-        tokio::select! {
+        let found = tokio::select! {
             v = probe => Some(v),
-            () = moved => None,
+            () = disturbed => None,
+        };
+        // The Mac can sleep through a probe with its timeout running and
+        // say so only on its next tick, by which time the probe has long
+        // failed. What such a probe found is about the sleep.
+        if let Some(slept) = clock.slept() {
+            self.log(format_args!(
+                "probe slept {}s: it says nothing",
+                slept.as_secs()
+            ));
+            return None;
         }
+        found
     }
 
     /// Reads the tunnel counters; true when over the last window packets
@@ -411,6 +465,7 @@ impl Link {
     }
 
     async fn connect(&mut self) {
+        let after_degraded = std::mem::take(&mut self.after_degraded);
         self.generation = SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         self.log(format_args!("connect attempt={}", self.failures + 1));
         let start = Instant::now();
@@ -441,6 +496,10 @@ impl Link {
         ));
         let name = new.name.clone();
         let old = self.tunnel.replace(new);
+        // The counters start over with the interface: mark where they are,
+        // so the first check measures this tunnel and not the one it
+        // replaced.
+        self.rx_seen = probe::counters(&name).await.map(|c| c.rx_bytes);
         self.unhealthy();
         self.pinged = false;
         // The routes go to the new interface, and pf lets them out through
@@ -452,7 +511,7 @@ impl Link {
             self.log(format_args!("down {shown}"));
         }
         let start = Instant::now();
-        match self.unless_moved(probe::tls(&name, CONFIRM)).await {
+        match self.undisturbed(probe::tls(&name, CONFIRM)).await {
             Some(true) => {
                 let now = Instant::now();
                 self.log(format_args!(
@@ -473,10 +532,27 @@ impl Link {
                 // TLS: the data is.
                 let seen = self.tunnel_seen().await;
                 self.log(format_args!("confirm-fail {seen}"));
-                self.failed();
+                if after_degraded {
+                    // The one reconnect degradation asked for did not help.
+                    // The tunnel goes to the checks rather than to the fast
+                    // attempts: once it is past the young window they can
+                    // tell a rotten path from a dead tunnel, while a row of
+                    // reconnects over a rotten path costs every session of
+                    // the Mac for nothing.
+                    self.degradation.harder();
+                    self.connect_at = None;
+                    self.check_at = Instant::now() + degraded::YOUNG;
+                    self.next = Next::Usual;
+                    self.log(format_args!(
+                        "left alone for {}s: the reconnect after degradation did not confirm",
+                        degraded::YOUNG.as_secs()
+                    ));
+                } else {
+                    self.failed();
+                }
             }
             None => {
-                self.log(format_args!("confirm aborted: network changed"));
+                self.log(format_args!("confirm aborted: network changed or woke"));
                 // Not this tunnel's failure: the next one goes out on the
                 // new network.
                 self.connect_at = Some(Instant::now());
@@ -516,10 +592,11 @@ impl Link {
         self.connect_at = Some(now + Duration::from_secs(secs));
     }
 
-    /// A probe was cut short by a network change: nothing learned about the
-    /// tunnel, asked again on the new network.
+    /// A probe was cut short by a new network or a wake, or it sat out a
+    /// sleep: nothing learned about the tunnel, so it is asked again -
+    /// where the Mac is now, and awake.
     fn aborted(&mut self, next: Next) {
-        self.log(format_args!("check aborted: network changed"));
+        self.log(format_args!("check aborted: network changed or woke"));
         self.next = next;
         self.check_at = Instant::now();
         let n = self.net.borrow_and_update().clone();
@@ -536,6 +613,10 @@ impl Link {
             return;
         };
         let (name, index) = (t.name.clone(), t.index);
+        // Bytes from the peer over the interval since the last check,
+        // probes and all: a tunnel that still gets them is not dead,
+        // whatever the probes say.
+        let rx_grew = self.rx_grew(&name).await;
         let next = std::mem::replace(&mut self.next, Next::Usual);
         let (cut, woke) = (next == Next::Cut, next == Next::Woke);
         let (ping_limit, tls_limit) = if woke {
@@ -550,7 +631,7 @@ impl Link {
         let start = Instant::now();
         let bound = NonZeroU32::new(u32::from(index));
         let Some(rtt) = self
-            .unless_moved(probe::ping(bound, &TARGETS, ping_limit))
+            .undisturbed(probe::ping(bound, &TARGETS, ping_limit))
             .await
         else {
             return self.aborted(next);
@@ -568,7 +649,7 @@ impl Link {
                     self.since = None;
                     self.sync().await;
                 }
-                match self.unless_moved(probe::tls(&name, limit)).await {
+                match self.undisturbed(probe::tls(&name, limit)).await {
                     None => return self.aborted(next),
                     Some(ok) => ok.then(|| Found::Tls(start.elapsed())),
                 }
@@ -594,10 +675,15 @@ impl Link {
             self.recovered(now);
             return;
         }
+        // Failing the probes does not settle it: a tunnel the peer still
+        // answers through is degraded, not down.
+        if self.degraded(rx_grew).await {
+            return;
+        }
         self.unhealthy();
         // The rules leave it before the probe past the tunnel.
         self.sync().await;
-        match self.unless_moved(self.direct()).await {
+        match self.undisturbed(self.direct()).await {
             None => self.aborted(Next::Usual),
             Some(true) => self.lost(if cut { "cut" } else { "dead" }),
             Some(false) if !self.offline => {
@@ -608,6 +694,74 @@ impl Link {
             }
             Some(false) => {}
         }
+    }
+
+    /// A tunnel that gets nothing back from the probes while the peer
+    /// still answers it: the path there is rotten, and a reconnect does
+    /// not mend a path. True when the tunnel is dealt with here - left
+    /// alone, or given the one reconnect the patience allows.
+    async fn degraded(&mut self, rx_grew: bool) -> bool {
+        let (carrying, seen) = self.carrying(rx_grew).await;
+        match self.degradation.failed(Instant::now(), carrying) {
+            Verdict::Left(age) => {
+                let of = match self.degradation.patience() {
+                    p if p.is_zero() => "no limit".to_owned(),
+                    p => format!("{}s", p.as_secs()),
+                };
+                self.log(format_args!(
+                    "degraded {}s of {of}: {seen}; the tunnel is left alone",
+                    age.as_secs()
+                ));
+                self.health = Health::Degraded;
+                self.since = None;
+                true
+            }
+            Verdict::Restart => {
+                self.log(format_args!(
+                    "out of patience with the degraded tunnel: one reconnect; {seen}"
+                ));
+                self.after_degraded = true;
+                self.lost("degraded");
+                true
+            }
+            // Said in the journal, not only in the code: a check that fails
+            // is where the question "was it the tunnel or the path to it"
+            // gets asked, and it cannot be answered afterwards from lines
+            // that do not carry the evidence.
+            Verdict::Down => {
+                self.log(format_args!("not degraded: {seen}"));
+                false
+            }
+        }
+    }
+
+    /// True when the interface has received bytes since the last check.
+    async fn rx_grew(&mut self, name: &str) -> bool {
+        let Some(c) = probe::counters(name).await else {
+            return false;
+        };
+        let grew = self.rx_seen.is_some_and(|was| c.rx_bytes > was);
+        self.rx_seen = Some(c.rx_bytes);
+        grew
+    }
+
+    /// What the tunnel says of itself when no probe gets through: the peer
+    /// answered within the handshake window and its bytes are still coming.
+    /// A young tunnel says nothing - see `degraded`. Returns the evidence
+    /// as well, for the journal line that reports the verdict.
+    async fn carrying(&self, rx_grew: bool) -> (bool, String) {
+        let Some(t) = &self.tunnel else {
+            return (false, "no tunnel".to_owned());
+        };
+        let age = degraded::age(t.up_at, self.disturbed_at, Instant::now());
+        let handshake = t.handshake_age(&self.tools).await;
+        let seen = format!(
+            "up={}s handshake={} rx={}",
+            age.as_secs(),
+            handshake.map_or_else(|| "none".to_owned(), |s| format!("{s}s")),
+            if rx_grew { "grew" } else { "flat" }
+        );
+        (degraded::carrying(age, handshake, rx_grew), seen)
     }
 
     /// Writes what a check found; true when the tunnel carries.

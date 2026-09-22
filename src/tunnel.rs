@@ -10,7 +10,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
@@ -145,6 +145,10 @@ pub struct Tools {
 pub struct Tunnel {
     pub name: String,
     pub index: u16,
+    /// When the interface came up. Every tunnel watched here is a child of
+    /// this process - those of a dead daemon are stopped, not adopted - so
+    /// this is the age of the interface itself.
+    pub up_at: Instant,
     child: Child,
     name_file: PathBuf,
 }
@@ -181,6 +185,7 @@ impl Tunnel {
         let mut tunnel = Self {
             name,
             index: 0,
+            up_at: Instant::now(),
             child,
             name_file,
         };

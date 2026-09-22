@@ -267,6 +267,30 @@ pub struct Iface {
     pub index: u16,
 }
 
+/// What the checks of a link say of its tunnel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Health {
+    /// Not confirmed yet, or failed.
+    #[default]
+    Down,
+    /// The last confirmation or check went through.
+    Up,
+    /// A check found silent the ping that used to answer; TLS is to tell.
+    Suspect,
+    /// No probe gets through, yet the peer still answers: the tunnel keeps
+    /// the names and the routes it has, so the network limps on through
+    /// it, but a rule with another tunnel takes that one.
+    Degraded,
+}
+
+impl Health {
+    /// The tunnel is not to be walked away from: its names are answered
+    /// and its routes stand.
+    pub fn alive(self) -> bool {
+        self != Self::Down
+    }
+}
+
 /// A tunnel as its link reports it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LinkState {
@@ -274,10 +298,7 @@ pub struct LinkState {
     /// Which amneziawg-go has the interface: a new one may get the name and
     /// index of a dead one, whose routes went with it.
     pub generation: u32,
-    /// The last confirmation or check went through.
-    pub alive: bool,
-    /// A check found silent the ping that used to answer; TLS is to tell.
-    pub suspect: bool,
+    pub health: Health,
     /// A new network or a wake, until the first check after it.
     pub works: bool,
     /// Carrying without doubt since then.
@@ -288,7 +309,7 @@ pub struct LinkState {
 impl LinkState {
     /// Carries for certain: a rule may switch to it.
     fn good(&self) -> bool {
-        self.iface.is_some() && self.alive && !self.suspect
+        self.iface.is_some() && self.health == Health::Up
     }
 }
 
@@ -444,7 +465,7 @@ impl Core {
     fn reasons(&self, rule: usize) -> Reasons {
         let l = self.current(rule);
         Reasons {
-            tunnel: !l.is_some_and(|l| l.iface.is_some() && l.alive),
+            tunnel: !l.is_some_and(|l| l.iface.is_some() && l.health.alive()),
             works: l.is_some_and(|l| l.works),
             owner: self.owner,
         }
@@ -734,11 +755,12 @@ impl Resolver {
             .links
             .iter()
             .map(|(n, l)| {
-                let state = match (&l.iface, l.alive, l.suspect) {
-                    (None, _, _) => "down".to_owned(),
-                    (Some(i), true, false) => format!("{}#{}/alive", i.name, i.index),
-                    (Some(i), true, true) => format!("{}#{}/suspect", i.name, i.index),
-                    (Some(i), false, _) => format!("{}#{}/dead", i.name, i.index),
+                let state = match (&l.iface, l.health) {
+                    (None, _) => "down".to_owned(),
+                    (Some(i), Health::Down) => format!("{}#{}/dead", i.name, i.index),
+                    (Some(i), Health::Up) => format!("{}#{}/alive", i.name, i.index),
+                    (Some(i), Health::Suspect) => format!("{}#{}/suspect", i.name, i.index),
+                    (Some(i), Health::Degraded) => format!("{}#{}/degraded", i.name, i.index),
                 };
                 format!("{n}={state}")
             })
@@ -1358,7 +1380,7 @@ mod tests {
                 index,
             }),
             generation: u32::from(index),
-            alive,
+            health: if alive { Health::Up } else { Health::Down },
             since,
             ..LinkState::default()
         }
@@ -1382,10 +1404,17 @@ mod tests {
         assert_eq!(pick(&order, &dead, Some(0), now), Some(1));
         // Suspect: the second, if it carries.
         let mut suspect = [link(4, true, long), link(5, true, long)];
-        suspect[0].suspect = true;
+        suspect[0].health = Health::Suspect;
         assert_eq!(pick(&order, &suspect, Some(0), now), Some(1));
-        suspect[1].alive = false;
+        suspect[1].health = Health::Down;
         assert_eq!(pick(&order, &suspect, Some(0), now), Some(0));
+        // Degraded: the same, and it keeps its names and routes meanwhile.
+        let mut degraded = [link(4, true, long), link(5, true, long)];
+        degraded[0].health = Health::Degraded;
+        assert_eq!(pick(&order, &degraded, Some(0), now), Some(1));
+        assert!(degraded[0].health.alive());
+        degraded[1].health = Health::Down;
+        assert_eq!(pick(&order, &degraded, Some(0), now), Some(0));
         // None carries: stays; nothing yet: the first with an interface.
         let none = [link(4, false, None), link(5, false, None)];
         assert_eq!(pick(&order, &none, Some(1), now), Some(1));

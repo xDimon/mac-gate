@@ -259,7 +259,7 @@ fn log_start(
         .map(|(t, c)| format!("{}:{}", t.name, c.ignored.join(",")))
         .collect();
     journal.log(format_args!(
-        "start daemon rules={} tunnels={} lists={} suffixes={} subnets={} rejected={} missing={} stale={} saved_hosts={saved} listen={} tunnel_dns={} window={}s use_fakeip={} conf_ignored={ignored:?}",
+        "start daemon rules={} tunnels={} lists={} suffixes={} subnets={} rejected={} missing={} stale={} saved_hosts={saved} listen={} tunnel_dns={} window={}s use_fakeip={} degraded_grace={}s conf_ignored={ignored:?}",
         settings.rules.len(),
         settings.tunnels.len(),
         settings.lists.len(),
@@ -272,6 +272,7 @@ fn log_start(
         cfg.tunnel_dns,
         cfg.window,
         if cfg.use_fakeip { "auto" } else { "off" },
+        settings.degraded_grace.as_secs(),
     ));
     for line in &lists.rejected {
         journal.log(format_args!("rejected {line}"));
@@ -337,7 +338,8 @@ fn spawn_links(
             tools.clone(),
             net.clone(),
             rx,
-        );
+        )
+        .grace(settings.degraded_grace);
         links.push((tx, tokio::spawn(link.run())));
     }
     links
