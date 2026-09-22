@@ -59,16 +59,16 @@ pub fn check(text: &str) -> Result<usize, String> {
     Ok(n)
 }
 
-/// How many entries a file holds, or why it could not be read: for the
-/// journal, where a changed file says what it now brings.
-fn entries_of(path: &Path) -> String {
+/// Whether a file reads as a list at all, and how many entries it holds or
+/// why it could not be read: for the journal, where a changed file says
+/// what it now brings, and for the step, which waits out what is no list.
+fn entries_of(path: &Path) -> (bool, String) {
     match fs::read_to_string(path) {
-        Ok(text) => {
-            let mut l = Lists::default();
-            l.add("count", &text);
-            format!("entries={}", l.entry_count())
-        }
-        Err(e) => format!("unreadable: {e}"),
+        Ok(text) => match check(&text) {
+            Ok(n) => (true, format!("entries={n}")),
+            Err(e) => (false, format!("no list: {e}")),
+        },
+        Err(e) => (false, format!("unreadable: {e}")),
     }
 }
 
@@ -195,6 +195,14 @@ fn due_in(fetched: Option<SystemTime>, now: SystemTime) -> Duration {
 
 type Fetched = Vec<(String, Result<(String, &'static str), String>)>;
 
+/// A file source and the modification times that decide when it is read:
+/// `taken` as of the last read, `seen` as of the last step.
+struct Stamp {
+    path: PathBuf,
+    taken: Option<SystemTime>,
+    seen: Option<SystemTime>,
+}
+
 /// Keeps the lists current: looks at the files every step, fetches the
 /// URLs when due, in a task of its own so that the watch never waits on it.
 pub struct Updater {
@@ -202,8 +210,8 @@ pub struct Updater {
     base: PathBuf,
     cache: PathBuf,
     flag: PathBuf,
-    /// The file sources and their modification times as last read.
-    stamps: Vec<(PathBuf, Option<SystemTime>)>,
+    /// The file sources and the times that decide when they are read.
+    stamps: Vec<Stamp>,
     due: HashMap<String, Instant>,
     task: Option<JoinHandle<Fetched>>,
 }
@@ -225,7 +233,11 @@ impl Updater {
             .map(|p| {
                 let path = base.join(p);
                 let t = modified(&path);
-                (path, t)
+                Stamp {
+                    path,
+                    taken: t,
+                    seen: t,
+                }
             })
             .collect();
         Self {
@@ -263,18 +275,7 @@ impl Updater {
                 Err(e) => journal.log(format_args!("sources-fail task: {e}")),
             }
         }
-        for (path, stamp) in &mut self.stamps {
-            let t = modified(path);
-            if t != *stamp {
-                *stamp = t;
-                changed = true;
-                journal.log(format_args!(
-                    "source {} changed {}",
-                    path.display(),
-                    entries_of(path)
-                ));
-            }
-        }
+        changed |= self.follow_files(journal);
         if self.task.is_none() {
             let due: Vec<String> = self
                 .due
@@ -296,6 +297,40 @@ impl Updater {
                     out
                 }));
             }
+        }
+        changed
+    }
+
+    /// Looks at the file sources. A change is taken in only once the
+    /// modification time has held still for a step, or the file reads as a
+    /// list straight away: an editor that truncates in place leaves the file
+    /// holding nothing for a moment, and reading it there drops the entries
+    /// of that source and the routes of its subnets until the next step. A
+    /// file that settled on holding nothing is taken as it is — emptying a
+    /// list is the owner's to do. True when a source settled on a new state.
+    fn follow_files(&mut self, journal: &Journal) -> bool {
+        let mut changed = false;
+        for stamp in &mut self.stamps {
+            let t = modified(&stamp.path);
+            let moved = t != stamp.seen;
+            stamp.seen = t;
+            if t == stamp.taken {
+                continue;
+            }
+            let (is_list, what) = entries_of(&stamp.path);
+            if moved && !is_list {
+                journal.log(format_args!(
+                    "source-unsettled {} {what}",
+                    stamp.path.display()
+                ));
+                continue;
+            }
+            stamp.taken = t;
+            changed = true;
+            journal.log(format_args!(
+                "source {} changed {what}",
+                stamp.path.display()
+            ));
         }
         changed
     }
@@ -420,6 +455,43 @@ mod tests {
         let built = build(&s, &dir, &cache);
         assert!(built.lists.match_domain("example.com").is_empty());
         assert!(built.stale.is_empty() && built.missing.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file truncated in place before it is filled is not read halfway:
+    /// the step that catches it holding nothing waits, and the lists never
+    /// lose the source. Settled on nothing, it is taken as it is.
+    #[test]
+    fn a_file_being_written_waits_for_the_next_step() {
+        let dir = std::env::temp_dir().join(format!("mac-gate-write-{}", std::process::id()));
+        let cache = dir.join("cache");
+        let file = dir.join("lists/custom.lst");
+        fs::create_dir_all(dir.join("lists")).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(&file, "example.com\n").unwrap();
+        let s = parse(
+            "[[list]]\nname = \"custom\"\nsources = [\"lists/custom.lst\"]\n\
+             [[tunnel]]\nname = \"t\"\nconf = \"t.conf\"\n\
+             [[rule]]\nname = \"r\"\nwhen = \"always\"\nlists = [\"custom\"]\ntunnels = [\"t\"]\n",
+        )
+        .unwrap();
+        let journal = Journal::open(Some(&dir.join("journal"))).unwrap();
+        let mut u = Updater::new(s, &dir, &cache, dir.join("update"));
+        assert!(!u.follow_files(&journal));
+
+        // The editor truncates in place and the step catches it there.
+        fs::write(&file, "").unwrap();
+        assert!(!u.follow_files(&journal));
+        // Filled before the next step: the change is taken whole, once.
+        fs::write(&file, "example.com\nexample.org\n").unwrap();
+        assert!(u.follow_files(&journal));
+        assert!(!u.follow_files(&journal));
+
+        // Emptied on purpose: waited out once, then taken as it is.
+        fs::write(&file, "").unwrap();
+        assert!(!u.follow_files(&journal));
+        assert!(u.follow_files(&journal));
+        assert!(!u.follow_files(&journal));
         fs::remove_dir_all(&dir).unwrap();
     }
 }
